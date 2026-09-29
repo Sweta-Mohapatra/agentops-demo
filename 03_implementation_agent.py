@@ -154,12 +154,21 @@ RULES:
    adapt your code accordingly — you are a general-purpose coding agent.
 11. NEVER use dbutils.widgets — the notebook will be run programmatically.
 12. NEVER use spark.read.format("delta").load("table.name") — use spark.table("catalog.schema.table").
-13. DATE/TIMESTAMP HANDLING:
-   - All FHIR dates are ISO 8601 format: "2025-11-03T12:48:12+00:00"
-   - Use F.to_timestamp(col) with NO format argument — Spark auto-parses ISO 8601.
-   - NEVER use .cast("timestamp") on strings — always use F.to_timestamp().
-   - The _ingested_at column is ALREADY a TimestampType — do NOT cast or parse it.
-   - For date truncation to week: F.date_trunc("week", timestamp_col).
+13. DATE/TIMESTAMP HANDLING — HARD RULES (violation = broken code):
+   - Every date/timestamp in this dataset is ISO 8601: "2025-11-03T12:48:12+00:00"
+   - ONLY allowed parse call: F.to_timestamp(col)  — with NO second argument.
+     Spark auto-parses ISO 8601 natively. This is the ONLY way to convert date strings.
+   - ABSOLUTELY FORBIDDEN (will cause CAST_INVALID_INPUT errors):
+       ✗ .cast("timestamp")           — NEVER on strings
+       ✗ .cast("date")                — NEVER on strings
+       ✗ F.to_timestamp(col, "fmt")   — NEVER pass a format string
+       ✗ F.to_date(col, "fmt")        — NEVER pass a format string
+       ✗ F.date_format() for parsing  — it's for OUTPUT formatting only
+       ✗ F.unix_timestamp()           — NEVER use for parsing
+       ✗ Any hardcoded date format like "MM/dd/yyyy" or "dd/MM/yyyy"
+   - The _ingested_at column is ALREADY TimestampType — do NOT touch it.
+   - For week truncation: F.date_trunc("week", timestamp_col)
+   - For day diff: F.datediff(end_ts, start_ts) — works on timestamps directly.
 14. After .withColumn() on an aliased DataFrame, the alias is LOST. Either:
    - Do all .withColumn() calls BEFORE joining, OR
    - Re-alias after .withColumn(): df = df.withColumn(...).alias("enc")
@@ -203,6 +212,52 @@ IMPORTANT: Use the EXACT JSON field paths shown above. For example:
 - Encounter class: F.get_json_object(F.col("raw_json"), "$.class.code")
 - Claim amounts: F.get_json_object(F.col("raw_json"), "$.total.value")
 - Organization name: F.get_json_object(F.col("raw_json"), "$.name")
+
+== FHIR DATA MODEL & JOIN KEYS (CRITICAL — use these exact patterns) ==
+
+REFERENCE FIELDS contain prefixes that must be stripped before joining:
+  - encounter $.subject.reference = "Patient/pat-000325"  → strip "Patient/" to get "pat-000325"
+  - encounter $.serviceProvider.reference = "Organization/org-000005" → strip "Organization/" to get "org-000005"
+  - claim $.item[0].encounter[0].reference = "Encounter/enc-000497" → strip "Encounter/" to get "enc-000497"
+  - claim $.patient.reference = "Patient/pat-000338" → strip "Patient/" to get "pat-000338"
+
+Strip with: F.regexp_replace(col, "^.*?/", "")
+
+JOIN KEYS:
+  - encounter → organization: strip encounter's serviceProvider.reference → match organization resource_id
+  - encounter → patient: strip encounter's subject.reference → match patient resource_id
+  - claim → encounter: strip claim's item[0].encounter[0].reference → match encounter resource_id
+
+ENCOUNTER CLASS CODES: "IMP" (inpatient=477), "AMB" (ambulatory=454), "EMER" (emergency=451)
+
+== METRIC IMPLEMENTATION RECIPES ==
+
+1. READMISSION RATE (30-day, per facility per week):
+   Step 1: Filter encounters to inpatient only (class.code = "IMP")
+   Step 2: Parse patient_id, org_id, period_start (admission), period_end (discharge) as timestamps
+   Step 3: Self-join inpatient encounters: for each discharge, find the NEXT admission
+           for the same patient at the same facility using a Window:
+             w = Window.partitionBy("patient_id", "org_id").orderBy("admission_ts")
+             imp_df = imp_df.withColumn("prev_discharge", F.lag("discharge_ts").over(w))
+             imp_df = imp_df.withColumn("days_since_prev", F.datediff(F.col("admission_ts"), F.col("prev_discharge")))
+             imp_df = imp_df.withColumn("is_readmission", (F.col("days_since_prev") <= 30) & (F.col("days_since_prev") > 0))
+   Step 4: Assign week_start = F.date_trunc("week", F.col("discharge_ts"))
+   Step 5: Aggregate per facility+week:
+             readmission_rate = SUM(is_readmission) / COUNT(*) as a ratio (0.0 to 1.0)
+
+2. TOTAL BILLED AMOUNT: claim $.total.value (cast to double). Join claim to encounter via
+   stripped item[0].encounter[0].reference == encounter resource_id.
+   SUM per facility+week.
+
+3. TOTAL PAID AMOUNT: This FHIR dataset has NO separate payment field (no $.payment).
+   Use $.total.value as the paid proxy (billed = paid assumption), OR set to same as billed.
+   Do NOT leave as 0 — use: total_paid_amount = total_billed_amount
+
+4. AVERAGE LENGTH OF STAY (inpatient only):
+   LOS = F.datediff(discharge_ts, admission_ts) for class.code = "IMP" only.
+   AVG per facility+week. Exclude encounters where LOS is null or <= 0.
+
+5. NUMBER OF ENCOUNTERS: COUNT of all encounters (IMP + AMB + EMER) per facility+week.
 
 Generate the complete PySpark implementation code.
 """
@@ -519,13 +574,44 @@ Your previous code FAILED. Fix the issues below and regenerate COMPLETE code.
     claim = spark.table("agentops.bronze.claim").alias("claim")
     joined = enc.join(claim, F.col("enc.resource_id") == F.col("claim.resource_id"))
     joined.select(F.col("enc.resource_id").alias("encounter_id"), ...)
-- After parsing raw_json, rename common columns BEFORE joining to avoid ambiguity
-- For FHIR resources: resource_id in encounter is a UUID, use get_json_object to extract nested fields
-- DATE/TIMESTAMP: All FHIR dates are ISO 8601 (e.g. "2025-11-03T12:48:12+00:00").
-  Use F.to_timestamp(col) with NO format argument — Spark auto-parses ISO 8601.
-  NEVER use .cast("timestamp") on strings. The _ingested_at column is ALREADY TimestampType.
 - ALIAS LOSS: After .withColumn() on an aliased DF, the alias is lost. Do ALL
   .withColumn() calls BEFORE joining, or re-alias: df = df.withColumn(...).alias("enc")
+
+== DATE/TIMESTAMP — ABSOLUTE RULES (violation = CAST_INVALID_INPUT crash) ==
+- Every date string in this data is ISO 8601: "2025-11-03T12:48:12+00:00"
+- ONLY allowed call: F.to_timestamp(col) — with NO second argument. Period.
+- FORBIDDEN (will crash):
+    X .cast("timestamp")         — NEVER on strings
+    X .cast("date")              — NEVER on strings
+    X F.to_timestamp(col, "fmt") — NEVER pass a format string
+    X F.to_date(col, "fmt")      — NEVER pass a format string
+    X F.date_format() for parsing — it is for OUTPUT formatting only
+    X F.unix_timestamp()          — NEVER for parsing
+    X Any literal like "MM/dd/yyyy", "dd/MM/yyyy", "yyyy-MM-dd HH:mm:ss"
+- _ingested_at is ALREADY TimestampType — do NOT touch it.
+- Week truncation: F.date_trunc("week", ts_col)
+- Day diff: F.datediff(end_ts, start_ts)
+
+== FHIR DATA MODEL & JOIN KEYS ==
+REFERENCE FIELDS contain prefixes — strip before joining:
+  encounter $.subject.reference = "Patient/pat-000325" → strip "Patient/" → "pat-000325"
+  encounter $.serviceProvider.reference = "Organization/org-000005" → strip "Organization/" → "org-000005"
+  claim $.item[0].encounter[0].reference = "Encounter/enc-000497" → strip "Encounter/" → "enc-000497"
+Strip with: F.regexp_replace(col, "^.*?/", "")
+JOIN KEYS:
+  encounter → organization: stripped serviceProvider.reference == organization resource_id
+  claim → encounter: stripped item[0].encounter[0].reference == encounter resource_id
+ENCOUNTER CLASS CODES: "IMP" (inpatient), "AMB" (ambulatory), "EMER" (emergency)
+
+== METRIC RECIPES ==
+1. READMISSION RATE: filter IMP encounters. Window by patient_id+org_id ordered by admission.
+   F.lag("discharge_ts") → days_since_prev = F.datediff(admission, prev_discharge).
+   is_readmission = (days_since_prev <= 30) & (days_since_prev > 0).
+   Rate = SUM(is_readmission.cast("int")) / COUNT(*) per facility+week.
+2. BILLED: claim $.total.value cast to double. Join claim→encounter. SUM per facility+week.
+3. PAID: No $.payment field exists. Set total_paid_amount = total_billed_amount.
+4. AVG LOS: F.datediff(discharge, admission) for IMP only. AVG per facility+week.
+5. ENCOUNTER COUNT: COUNT(*) of all encounters per facility+week.
 
 == ORIGINAL REQUIREMENT SPEC ==
 {yaml.dump(yaml_spec, default_flow_style=False)}
