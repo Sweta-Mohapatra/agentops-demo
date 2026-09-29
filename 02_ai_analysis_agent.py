@@ -32,7 +32,7 @@ dbutils.widgets.text("request_id", "DBXCOE-24", "Request ID from Stage 01")
 dbutils.widgets.text("secret_scope", "jira-intake", "Databricks Secret Scope")
 dbutils.widgets.text("fm_endpoint", "databricks-meta-llama-3-3-70b-instruct", "Foundation Model Endpoint")
 dbutils.widgets.text("catalog", "agentops", "Target Catalog")
-dbutils.widgets.text("codebase_root", "/Workspace/Users/sweta.mohapatra@ascendion.com/Agent Delivery Framework", "Codebase root folder")
+dbutils.widgets.text("codebase_root", "/Workspace/Repos/sweta.mohapatra@ascendion.com/agentops-demo", "Codebase root folder (Git repo)")
 
 REQUEST_ID     = dbutils.widgets.get("request_id").strip()
 SECRET_SCOPE   = dbutils.widgets.get("secret_scope")
@@ -132,6 +132,10 @@ print("=" * 60)
 print("GIT REPO ANALYSIS")
 print("=" * 60)
 
+# Normalize paths: strip /Workspace prefix for consistent comparison
+def _norm(p: str) -> str:
+    return p.replace("/Workspace", "") if p.startswith("/Workspace") else p
+
 git_repos = []
 try:
     for r in w.repos.list():
@@ -142,22 +146,49 @@ try:
 except Exception as e:
     print(f"  Warning: cannot list repos: {e}")
 
+# Also discover the codebase repo via REST is_git_folder check
+codebase_norm = _norm(CODEBASE_ROOT)
+try:
+    gs_resp = requests.get(
+        f"https://{workspace_url}/api/2.0/workspace/get-status",
+        headers=headers,
+        params={"path": codebase_norm},
+    )
+    if gs_resp.ok:
+        gs_data = gs_resp.json()
+        if gs_data.get("directory_info", {}).get("is_git_folder", False):
+            oid = gs_data["object_id"]
+            rr = requests.get(f"https://{workspace_url}/api/2.0/repos/{oid}", headers=headers)
+            if rr.ok:
+                rd = rr.json()
+                if not any(g.get("id") == rd["id"] for g in git_repos):
+                    git_repos.append({
+                        "id": rd["id"], "path": rd["path"], "url": rd.get("url", ""),
+                        "branch": rd.get("branch", ""), "provider": rd.get("provider", ""),
+                    })
+                    print(f"  Discovered codebase Git folder: {rd['path']} -> {rd.get('url')} [{rd.get('branch')}]")
+except Exception as e:
+    print(f"  Warning (codebase git check): {e}")
+
 print(f"\nGit folders in workspace: {len(git_repos)}")
 for repo in git_repos:
     print(f"  {repo['path']}")
-    print(f"    → {repo['url']}  [{repo['branch']}]")
+    print(f"    \u2192 {repo['url']}  [{repo['branch']}]")
 
 # ---- 2. Check if codebase root is inside a Git folder ----
 codebase_in_git = False
 codebase_git_repo = None
+
 for repo in git_repos:
-    if CODEBASE_ROOT.startswith(repo["path"].replace("/Workspace", "")):
+    repo_norm = _norm(repo["path"])
+    if codebase_norm == repo_norm or codebase_norm.startswith(repo_norm + "/"):
         codebase_in_git = True
         codebase_git_repo = repo
         break
 
 if codebase_in_git:
     print(f"\n✓ Codebase root IS in Git folder: {codebase_git_repo['path']}")
+    print(f"  Remote: {codebase_git_repo['url']}  [{codebase_git_repo['branch']}]")
 else:
     print(f"\n⚠ Codebase root ({CODEBASE_ROOT}) is NOT in a Git folder")
     print("  Recommendation: move to a Git repo for version control and CI/CD")
@@ -210,6 +241,9 @@ def scan_folder_recursive(path: str, depth: int = 0, max_depth: int = 4) -> list
         return results
     try:
         for obj in w.workspace.list(path):
+            # Skip .git internals
+            if obj.path and "/.git" in obj.path:
+                continue
             if obj.object_type in (ObjectType.NOTEBOOK, ObjectType.FILE):
                 results.append({"path": obj.path, "type": str(obj.object_type), "language": str(obj.language) if obj.language else None})
             elif obj.object_type == ObjectType.DIRECTORY:
