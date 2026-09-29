@@ -124,8 +124,8 @@ print(analysis_yaml[:800] if analysis_yaml else "(empty)")
 # ---------------------------------------------------------------------------
 # AGENT 03A: CODING AGENT
 # Reads the analysis report + intake spec and generates implementation code.
-# Generic: handles ETL pipelines, report builds, ML features, migrations, etc.
-# Service: Notebooks + Lakeflow Spark Declarative Pipelines
+# Generic — works with any dataset (healthcare, finance, IoT, retail, logs, etc.)
+# Supports: ETL, optimization, ML features, data quality, CDC, reports, joins, migrations
 # ---------------------------------------------------------------------------
 print("=" * 60)
 print("AGENT 03A: CODING AGENT")
@@ -154,43 +154,150 @@ RULES:
    adapt your code accordingly — you are a general-purpose coding agent.
 11. NEVER use dbutils.widgets — the notebook will be run programmatically.
 12. NEVER use spark.read.format("delta").load("table.name") — use spark.table("catalog.schema.table").
-13. DATE/TIMESTAMP HANDLING — HARD RULES (violation = broken code):
-   - Every date/timestamp in this dataset is ISO 8601: "2025-11-03T12:48:12+00:00"
-   - ONLY allowed parse call: F.to_timestamp(col)  — with NO second argument.
-     Spark auto-parses ISO 8601 natively. This is the ONLY way to convert date strings.
-   - ABSOLUTELY FORBIDDEN (will cause CAST_INVALID_INPUT errors):
-       ✗ .cast("timestamp")           — NEVER on strings
-       ✗ .cast("date")                — NEVER on strings
-       ✗ F.to_timestamp(col, "fmt")   — NEVER pass a format string
-       ✗ F.to_date(col, "fmt")        — NEVER pass a format string
-       ✗ F.date_format() for parsing  — it's for OUTPUT formatting only
-       ✗ F.unix_timestamp()           — NEVER use for parsing
-       ✗ Any hardcoded date format like "MM/dd/yyyy" or "dd/MM/yyyy"
-   - The _ingested_at column is ALREADY TimestampType — do NOT touch it.
-   - For week truncation: F.date_trunc("week", timestamp_col)
-   - For day diff: F.datediff(end_ts, start_ts) — works on timestamps directly.
+13. DATE/TIMESTAMP — ALWAYS read the DATA PROFILE section for actual formats:
+   - For ISO 8601 strings ("2025-01-15T08:30:00+00:00"): F.to_timestamp(col) — NO format arg
+   - For custom string formats: F.to_timestamp(col, "exact_format_from_profile")
+   - For already-typed Timestamp/Date columns: use directly, do NOT parse
+   - NEVER use .cast("timestamp") or .cast("date") on strings
+   - NEVER guess date formats — use ONLY what the DATA PROFILE tells you
+   - F.date_trunc("week", ts) for weeks, F.datediff(end, start) for days
 14. After .withColumn() on an aliased DataFrame, the alias is LOST. Either:
    - Do all .withColumn() calls BEFORE joining, OR
    - Re-alias after .withColumn(): df = df.withColumn(...).alias("enc")
 """
 
-# Sample actual raw_json from each bronze source so the LLM knows real field paths
-bronze_json_samples = {}
-for src in yaml_spec.get("bronze_sources", []):
-    try:
-        row = spark.table(src).select("raw_json").limit(1).collect()
-        if row:
-            import json as _json
-            parsed = _json.loads(row[0]["raw_json"])
-            bronze_json_samples[src] = _json.dumps(parsed, indent=2)[:1200]
-    except Exception:
-        pass
+# ── AUTO DATA PROFILER ── (works with any dataset: JSON-in-raw_json, structured, nested)
+import json as _json
+from collections import defaultdict
 
-json_samples_text = "\n".join(f"--- {tbl} sample raw_json ---\n{sample}" for tbl, sample in bronze_json_samples.items())
+data_profile = {"tables": {}, "date_formats": [], "ref_patterns": [], "join_keys": []}
+source_tables = yaml_spec.get("bronze_sources", yaml_spec.get("sources", []))
+
+for src in source_tables:
+    try:
+        tbl = spark.table(src)
+        schema_fields = [(f.name, str(f.dataType)) for f in tbl.schema.fields]
+        sample = tbl.limit(1).collect()
+        profile = {"schema": schema_fields, "rows": tbl.count()}
+
+        if any(f.name == "raw_json" for f in tbl.schema.fields) and sample:
+            parsed = _json.loads(sample[0]["raw_json"])
+            profile["json_sample"] = _json.dumps(parsed, indent=2)[:1500]
+            profile["format"] = "json_in_raw_json"
+
+            def _walk(obj, path="$"):
+                out = {"dates": [], "refs": []}
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        sub = _walk(v, f"{path}.{k}")
+                        out["dates"].extend(sub["dates"]); out["refs"].extend(sub["refs"])
+                elif isinstance(obj, str):
+                    if re.match(r"\d{4}-\d{2}-\d{2}T", obj):
+                        out["dates"].append({"path": path, "sample": obj, "fmt": "ISO_8601", "parse": "F.to_timestamp(col)"})
+                    elif re.match(r"\d{2}/\d{2}/\d{4}", obj):
+                        out["dates"].append({"path": path, "sample": obj, "fmt": "MM/dd/yyyy", "parse": 'F.to_timestamp(col, "MM/dd/yyyy")'})
+                    elif re.match(r"\d{4}-\d{2}-\d{2}$", obj):
+                        out["dates"].append({"path": path, "sample": obj, "fmt": "yyyy-MM-dd", "parse": "F.to_date(col)"})
+                    if "/" in obj and not obj.startswith("http") and len(obj) < 80:
+                        pfx = obj.split("/")[0]
+                        if re.match(r"[A-Z]", pfx):
+                            out["refs"].append({"path": path, "sample": obj, "prefix": pfx})
+                return out
+
+            found = _walk(parsed)
+            for d in found["dates"]: data_profile["date_formats"].append({"table": src, **d})
+            for r in found["refs"]: data_profile["ref_patterns"].append({"table": src, **r})
+        else:
+            profile["format"] = "structured"
+            for f in tbl.schema.fields:
+                if "timestamp" in str(f.dataType).lower() or "date" in str(f.dataType).lower():
+                    data_profile["date_formats"].append({"table": src, "path": f.name, "fmt": "ALREADY_TYPED", "parse": "use directly"})
+                elif "string" in str(f.dataType).lower() and sample:
+                    v = str(sample[0][f.name] or "")
+                    if re.match(r"\d{4}-\d{2}-\d{2}T", v):
+                        data_profile["date_formats"].append({"table": src, "path": f.name, "sample": v, "fmt": "ISO_8601", "parse": "F.to_timestamp(col)"})
+
+        data_profile["tables"][src] = profile
+    except Exception as e:
+        data_profile["tables"][src] = {"error": str(e)[:200]}
+
+# Auto-discover join keys from reference patterns
+pfx_map = defaultdict(list)
+for rp in data_profile["ref_patterns"]:
+    pfx_map[rp["prefix"].lower()].append(rp)
+for pfx, refs in pfx_map.items():
+    for tbl_name in data_profile["tables"]:
+        if pfx in tbl_name.lower().split(".")[-1]:
+            data_profile["join_keys"].append({
+                "from": [(r["table"], r["path"]) for r in refs],
+                "to": f"{tbl_name}.resource_id",
+                "strip": f"{refs[0]['prefix']}/",
+                "how": 'F.regexp_replace(col, "^.*?/", "")'
+            })
+
+# ── FORMAT PROFILE FOR LLM ──
+profile_text = "== AUTO-DISCOVERED DATA PROFILE ==\n"
+for tbl_name, info in data_profile["tables"].items():
+    profile_text += f"\n--- {tbl_name} ({info.get('rows', '?')} rows) ---\n"
+    profile_text += f"Format: {info.get('format', '?')} | Schema: {info.get('schema', [])}\n"
+    if "json_sample" in info:
+        profile_text += f"JSON sample:\n{info['json_sample']}\n"
+
+if data_profile["date_formats"]:
+    profile_text += "\n== DATE/TIMESTAMP FORMATS (use these EXACT parse methods) ==\n"
+    seen = set()
+    for d in data_profile["date_formats"]:
+        k = f"{d['table']}:{d['path']}"
+        if k not in seen:
+            seen.add(k)
+            profile_text += f"  {d['table']} -> {d['path']}: {d['fmt']} (sample: {d.get('sample','N/A')}) -> {d['parse']}\n"
+
+if data_profile["join_keys"]:
+    profile_text += "\n== AUTO-DISCOVERED JOIN KEYS ==\n"
+    for jk in data_profile["join_keys"]:
+        for src_tbl, src_path in jk["from"]:
+            profile_text += f"  {src_tbl} {src_path} -> strip \"{jk['strip']}\" -> match {jk['to']}\n"
+        profile_text += f"  Pattern: {jk['how']}\n"
+
+if data_profile["ref_patterns"]:
+    profile_text += "\n== REFERENCE FIELDS ==\n"
+    for rp in data_profile["ref_patterns"]:
+        profile_text += f"  {rp['table']} {rp['path']} = \"{rp['sample']}\" (prefix: {rp['prefix']})\n"
+
+# ── TASK-TYPE GUIDANCE ──
+TASK_GUIDANCE = {
+    "new_pipeline": "Build complete ETL: read sources, transform, aggregate to spec grain, write to target.",
+    "modify_existing": "Modify existing pipeline logic per spec. Preserve existing code where possible.",
+    "optimize_query": "Rewrite for performance: partition pruning, broadcast joins, column pruning, caching.",
+    "data_quality": "Implement DQ checks: nulls, uniqueness, referential integrity, ranges. Write to DQ log.",
+    "ml_feature": "Build feature engineering: parse, compute features, handle nulls, encode, normalize.",
+    "migration": "Migrate data: schema evolution, type mapping, validate counts, rollback plan.",
+    "report": "Build analytical report: parse, business logic, compute all metrics, aggregate, write gold.",
+    "cdc_pipeline": "Implement CDC with MERGE INTO: inserts/updates/deletes, sequence ordering, dedup.",
+    "join_optimization": "Optimize joins: broadcast hints, fix Cartesian products, predicates, skew handling.",
+    "data_profiling": "Profile tables: distributions, nulls, outliers, cardinality. Write summary table.",
+    "schema_evolution": "Handle schema changes: add columns, rename, type widening, backward compatibility.",
+    "streaming_pipeline": "Build Structured Streaming pipeline: readStream, transforms, writeStream with checkpoint.",
+}
+task_type = recommendation or "new_pipeline"
+task_guidance = TASK_GUIDANCE.get(task_type, TASK_GUIDANCE.get("report", ""))
+
+# ── DYNAMIC METRIC SECTION ──
+metrics = yaml_spec.get("metrics", [])
+metric_text = ""
+if metrics:
+    metric_text = "== REQUESTED METRICS (implement ALL of these) ==\n"
+    for i, m in enumerate(metrics, 1):
+        metric_text += f"  {i}. {m.get('name', f'metric_{i}')}: {m.get('description', '')}\n"
+        if m.get("grain"):
+            metric_text += f"     Grain: {m['grain']}\n"
+    if yaml_spec.get("grain"):
+        metric_text += f"\n  Aggregation grain: {yaml_spec['grain']}\n"
 
 coding_prompt = f"""
 == TASK ==
-Implement the following requirement. Recommendation: {recommendation}
+Implement the following requirement.
+Task type: {task_type} — {task_guidance}
 
 == REQUIREMENT SPEC (from Jira) ==
 {yaml.dump(yaml_spec, default_flow_style=False)}
@@ -204,60 +311,13 @@ Implement the following requirement. Recommendation: {recommendation}
 == TARGET TABLE ==
 {target_table}
 
-== ACTUAL BRONZE TABLE raw_json SAMPLES (use these exact JSON paths!) ==
-{json_samples_text}
+{profile_text}
 
-IMPORTANT: Use the EXACT JSON field paths shown above. For example:
-- Encounter period: F.get_json_object(F.col("raw_json"), "$.period.start")
-- Encounter class: F.get_json_object(F.col("raw_json"), "$.class.code")
-- Claim amounts: F.get_json_object(F.col("raw_json"), "$.total.value")
-- Organization name: F.get_json_object(F.col("raw_json"), "$.name")
+{metric_text}
 
-== FHIR DATA MODEL & JOIN KEYS (CRITICAL — use these exact patterns) ==
-
-REFERENCE FIELDS contain prefixes that must be stripped before joining:
-  - encounter $.subject.reference = "Patient/pat-000325"  → strip "Patient/" to get "pat-000325"
-  - encounter $.serviceProvider.reference = "Organization/org-000005" → strip "Organization/" to get "org-000005"
-  - claim $.item[0].encounter[0].reference = "Encounter/enc-000497" → strip "Encounter/" to get "enc-000497"
-  - claim $.patient.reference = "Patient/pat-000338" → strip "Patient/" to get "pat-000338"
-
-Strip with: F.regexp_replace(col, "^.*?/", "")
-
-JOIN KEYS:
-  - encounter → organization: strip encounter's serviceProvider.reference → match organization resource_id
-  - encounter → patient: strip encounter's subject.reference → match patient resource_id
-  - claim → encounter: strip claim's item[0].encounter[0].reference → match encounter resource_id
-
-ENCOUNTER CLASS CODES: "IMP" (inpatient=477), "AMB" (ambulatory=454), "EMER" (emergency=451)
-
-== METRIC IMPLEMENTATION RECIPES ==
-
-1. READMISSION RATE (30-day, per facility per week):
-   Step 1: Filter encounters to inpatient only (class.code = "IMP")
-   Step 2: Parse patient_id, org_id, period_start (admission), period_end (discharge) as timestamps
-   Step 3: Self-join inpatient encounters: for each discharge, find the NEXT admission
-           for the same patient at the same facility using a Window:
-             w = Window.partitionBy("patient_id", "org_id").orderBy("admission_ts")
-             imp_df = imp_df.withColumn("prev_discharge", F.lag("discharge_ts").over(w))
-             imp_df = imp_df.withColumn("days_since_prev", F.datediff(F.col("admission_ts"), F.col("prev_discharge")))
-             imp_df = imp_df.withColumn("is_readmission", (F.col("days_since_prev") <= 30) & (F.col("days_since_prev") > 0))
-   Step 4: Assign week_start = F.date_trunc("week", F.col("discharge_ts"))
-   Step 5: Aggregate per facility+week:
-             readmission_rate = SUM(is_readmission) / COUNT(*) as a ratio (0.0 to 1.0)
-
-2. TOTAL BILLED AMOUNT: claim $.total.value (cast to double). Join claim to encounter via
-   stripped item[0].encounter[0].reference == encounter resource_id.
-   SUM per facility+week.
-
-3. TOTAL PAID AMOUNT: This FHIR dataset has NO separate payment field (no $.payment).
-   Use $.total.value as the paid proxy (billed = paid assumption), OR set to same as billed.
-   Do NOT leave as 0 — use: total_paid_amount = total_billed_amount
-
-4. AVERAGE LENGTH OF STAY (inpatient only):
-   LOS = F.datediff(discharge_ts, admission_ts) for class.code = "IMP" only.
-   AVG per facility+week. Exclude encounters where LOS is null or <= 0.
-
-5. NUMBER OF ENCOUNTERS: COUNT of all encounters (IMP + AMB + EMER) per facility+week.
+IMPORTANT: Use the EXACT field paths, date parsing methods, and join key patterns
+from the AUTO-DISCOVERED DATA PROFILE above. Do NOT guess or hardcode field names.
+If a field is missing from the profile, skip that metric gracefully with a comment.
 
 Generate the complete PySpark implementation code.
 """
@@ -269,6 +329,11 @@ generated_code = re.sub(r'^```(?:python)?\s*', '', generated_code)
 generated_code = re.sub(r'\s*```$', '', generated_code)
 
 print(f"Generated code length: {len(generated_code)} chars")
+print(f"Task type: {task_type}")
+print(f"Tables profiled: {list(data_profile['tables'].keys())}")
+print(f"Date formats found: {len(data_profile['date_formats'])}")
+print(f"Join keys discovered: {len(data_profile['join_keys'])}")
+print(f"Reference patterns: {len(data_profile['ref_patterns'])}")
 print("\n--- Generated Code Preview (first 1500 chars) ---")
 print(generated_code[:1500])
 
@@ -577,41 +642,19 @@ Your previous code FAILED. Fix the issues below and regenerate COMPLETE code.
 - ALIAS LOSS: After .withColumn() on an aliased DF, the alias is lost. Do ALL
   .withColumn() calls BEFORE joining, or re-alias: df = df.withColumn(...).alias("enc")
 
-== DATE/TIMESTAMP — ABSOLUTE RULES (violation = CAST_INVALID_INPUT crash) ==
-- Every date string in this data is ISO 8601: "2025-11-03T12:48:12+00:00"
-- ONLY allowed call: F.to_timestamp(col) — with NO second argument. Period.
-- FORBIDDEN (will crash):
-    X .cast("timestamp")         — NEVER on strings
-    X .cast("date")              — NEVER on strings
-    X F.to_timestamp(col, "fmt") — NEVER pass a format string
-    X F.to_date(col, "fmt")      — NEVER pass a format string
-    X F.date_format() for parsing — it is for OUTPUT formatting only
-    X F.unix_timestamp()          — NEVER for parsing
-    X Any literal like "MM/dd/yyyy", "dd/MM/yyyy", "yyyy-MM-dd HH:mm:ss"
-- _ingested_at is ALREADY TimestampType — do NOT touch it.
-- Week truncation: F.date_trunc("week", ts_col)
-- Day diff: F.datediff(end_ts, start_ts)
+== DATE/TIMESTAMP — use the DATA PROFILE from the initial run ==
+- NEVER use .cast("timestamp") or .cast("date") on strings
+- NEVER guess date formats — use ONLY what the data profile told you
+- For ISO 8601 strings: F.to_timestamp(col) with NO format arg
+- For other formats: F.to_timestamp(col, "exact_format_from_profile")
+- Already-typed columns: use directly
+- F.date_trunc("week", ts) for weeks, F.datediff(end, start) for days
 
-== FHIR DATA MODEL & JOIN KEYS ==
-REFERENCE FIELDS contain prefixes — strip before joining:
-  encounter $.subject.reference = "Patient/pat-000325" → strip "Patient/" → "pat-000325"
-  encounter $.serviceProvider.reference = "Organization/org-000005" → strip "Organization/" → "org-000005"
-  claim $.item[0].encounter[0].reference = "Encounter/enc-000497" → strip "Encounter/" → "enc-000497"
-Strip with: F.regexp_replace(col, "^.*?/", "")
-JOIN KEYS:
-  encounter → organization: stripped serviceProvider.reference == organization resource_id
-  claim → encounter: stripped item[0].encounter[0].reference == encounter resource_id
-ENCOUNTER CLASS CODES: "IMP" (inpatient), "AMB" (ambulatory), "EMER" (emergency)
+== DATA PROFILE (auto-discovered from actual data) ==
+{profile_text}
 
-== METRIC RECIPES ==
-1. READMISSION RATE: filter IMP encounters. Window by patient_id+org_id ordered by admission.
-   F.lag("discharge_ts") → days_since_prev = F.datediff(admission, prev_discharge).
-   is_readmission = (days_since_prev <= 30) & (days_since_prev > 0).
-   Rate = SUM(is_readmission.cast("int")) / COUNT(*) per facility+week.
-2. BILLED: claim $.total.value cast to double. Join claim→encounter. SUM per facility+week.
-3. PAID: No $.payment field exists. Set total_paid_amount = total_billed_amount.
-4. AVG LOS: F.datediff(discharge, admission) for IMP only. AVG per facility+week.
-5. ENCOUNTER COUNT: COUNT(*) of all encounters per facility+week.
+== REQUESTED METRICS ==
+{metric_text}
 
 == ORIGINAL REQUIREMENT SPEC ==
 {yaml.dump(yaml_spec, default_flow_style=False)}
