@@ -34,7 +34,7 @@ from pyspark.sql.types import *
 
 dbutils.widgets.text("request_id", "DBXCOE-24", "Request ID")
 dbutils.widgets.text("secret_scope", "jira-intake", "Secret Scope")
-dbutils.widgets.text("fm_endpoint", "databricks-meta-llama-3-3-70b-instruct", "Foundation Model")
+dbutils.widgets.text("fm_endpoint", "databricks-gpt-5", "Foundation Model")
 dbutils.widgets.text("catalog", "agentops", "Catalog")
 dbutils.widgets.text("output_root", "/Users/sweta.mohapatra@ascendion.com/Agent Delivery Framework/generated", "Generated code output folder")
 
@@ -56,17 +56,25 @@ headers = {"Authorization": f"Bearer {token}"}
 client = OpenAI(base_url=f"https://{workspace_url}/serving-endpoints", api_key=token)
 
 def llm_call(system: str, user: str, temperature: float = 0.0, max_tokens: int = 4096) -> str:
-    """Generic LLM call with retry."""
+    """Generic LLM call with retry. Handles models that don't support temperature."""
     for attempt in range(3):
         try:
-            resp = client.chat.completions.create(
-                model=FM_ENDPOINT,
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                temperature=temperature if attempt == 0 else 0.0,
-                max_tokens=max_tokens,
-            )
+            kwargs = {
+                "model": FM_ENDPOINT,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                "max_tokens": max_tokens,
+            }
+            # Some models (Claude) don't support temperature
+            if "claude" not in FM_ENDPOINT.lower():
+                kwargs["temperature"] = temperature if attempt == 0 else 0.0
+            resp = client.chat.completions.create(**kwargs)
             return resp.choices[0].message.content.strip()
         except Exception as e:
+            if "temperature" in str(e).lower():
+                # Retry without temperature
+                kwargs.pop("temperature", None)
+                resp = client.chat.completions.create(**kwargs)
+                return resp.choices[0].message.content.strip()
             if attempt == 2:
                 raise
             print(f"  LLM retry {attempt+1}: {e}")
