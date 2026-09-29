@@ -154,6 +154,15 @@ RULES:
    adapt your code accordingly — you are a general-purpose coding agent.
 11. NEVER use dbutils.widgets — the notebook will be run programmatically.
 12. NEVER use spark.read.format("delta").load("table.name") — use spark.table("catalog.schema.table").
+13. DATE/TIMESTAMP HANDLING:
+   - All FHIR dates are ISO 8601 format: "2025-11-03T12:48:12+00:00"
+   - Use F.to_timestamp(col) with NO format argument — Spark auto-parses ISO 8601.
+   - NEVER use .cast("timestamp") on strings — always use F.to_timestamp().
+   - The _ingested_at column is ALREADY a TimestampType — do NOT cast or parse it.
+   - For date truncation to week: F.date_trunc("week", timestamp_col).
+14. After .withColumn() on an aliased DataFrame, the alias is LOST. Either:
+   - Do all .withColumn() calls BEFORE joining, OR
+   - Re-alias after .withColumn(): df = df.withColumn(...).alias("enc")
 """
 
 # Sample actual raw_json from each bronze source so the LLM knows real field paths
@@ -198,7 +207,7 @@ IMPORTANT: Use the EXACT JSON field paths shown above. For example:
 Generate the complete PySpark implementation code.
 """
 
-generated_code = llm_call(coding_system, coding_prompt, temperature=0.1, max_tokens=4096)
+generated_code = llm_call(coding_system, coding_prompt, temperature=0.1, max_tokens=8192)
 
 # Strip markdown fences if LLM wraps them
 generated_code = re.sub(r'^```(?:python)?\s*', '', generated_code)
@@ -471,16 +480,25 @@ def _all_tests_pass() -> bool:
     return all(t["passed"] for t in test_results.get("tests", []))
 
 def _build_fix_prompt(attempt: int, prev_code: str, error: str, tests: dict) -> str:
-    """Build an LLM prompt that includes the previous code + error feedback."""
+    """Build an LLM prompt that includes the previous code + error feedback.
+    Truncates previous code intelligently to stay within context limits."""
     failed_tests = [t for t in tests.get("tests", []) if not t["passed"]]
     test_summary = "\n".join(f"  - {t['name']}: {t['detail']}" for t in failed_tests)
+
+    # Smart truncation: keep first 6000 chars + last 2000 chars to preserve
+    # both the setup (imports, aliases) and the final write/display section
+    if len(prev_code) > 10000:
+        code_for_prompt = prev_code[:6000] + "\n\n# ... [MIDDLE SECTION TRUNCATED FOR BREVITY] ...\n\n" + prev_code[-2000:]
+    else:
+        code_for_prompt = prev_code
+
     return f"""
 == RETRY ATTEMPT {attempt}/{MAX_RETRIES} ==
 
 Your previous code FAILED. Fix the issues below and regenerate COMPLETE code.
 
 == PREVIOUS CODE ==
-{prev_code}
+{code_for_prompt}
 
 == EXECUTION ERROR ==
 {error or 'No runtime error (but validation tests failed)'}
@@ -503,6 +521,11 @@ Your previous code FAILED. Fix the issues below and regenerate COMPLETE code.
     joined.select(F.col("enc.resource_id").alias("encounter_id"), ...)
 - After parsing raw_json, rename common columns BEFORE joining to avoid ambiguity
 - For FHIR resources: resource_id in encounter is a UUID, use get_json_object to extract nested fields
+- DATE/TIMESTAMP: All FHIR dates are ISO 8601 (e.g. "2025-11-03T12:48:12+00:00").
+  Use F.to_timestamp(col) with NO format argument — Spark auto-parses ISO 8601.
+  NEVER use .cast("timestamp") on strings. The _ingested_at column is ALREADY TimestampType.
+- ALIAS LOSS: After .withColumn() on an aliased DF, the alias is lost. Do ALL
+  .withColumn() calls BEFORE joining, or re-alias: df = df.withColumn(...).alias("enc")
 
 == ORIGINAL REQUIREMENT SPEC ==
 {yaml.dump(yaml_spec, default_flow_style=False)}
@@ -589,7 +612,7 @@ if not _all_tests_pass():
         # 1. Ask LLM to fix the code
         fix_system = coding_system + "\n\nIMPORTANT: Your previous code failed. Fix the specific errors shown. Output ONLY executable Python code."
         fix_prompt = _build_fix_prompt(attempt, generated_code, sandbox_error, test_results)
-        new_code = llm_call(fix_system, fix_prompt, temperature=0.0, max_tokens=4096)
+        new_code = llm_call(fix_system, fix_prompt, temperature=0.0, max_tokens=8192)
         new_code = re.sub(r'^```(?:python)?\s*', '', new_code)
         new_code = re.sub(r'\s*```$', '', new_code)
         print(f"  Regenerated code: {len(new_code)} chars")
