@@ -130,17 +130,37 @@ RULES:
 1. Output ONLY executable Python code — no markdown, no explanation, no fences.
 2. The code must be a COMPLETE, self-contained Databricks notebook cell sequence.
 3. Start with necessary imports. Use `spark` (already available, do NOT create SparkSession).
-4. For bronze tables with raw_json column: parse JSON with from_json() or json_tuple().
-5. Write the final result using:
+4. For bronze tables with raw_json column: parse JSON with F.get_json_object(F.col("raw_json"), "$.field").
+   Example: df.withColumn("status", F.get_json_object(F.col("raw_json"), "$.status"))
+5. JOINS: Always alias tables and qualify columns to avoid AMBIGUOUS_REFERENCE:
+   enc = spark.table("catalog.schema.encounter").alias("enc")
+   clm = spark.table("catalog.schema.claim").alias("clm")
+   joined = enc.join(clm, F.col("enc.some_id") == F.col("clm.some_id"))
+6. Write the final result using:
    spark.sql("CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
    df.write.format("delta").mode("overwrite").option("overwriteSchema","true").saveAsTable("{target}")
-6. Add display(result_df.limit(20)) at the end for validation.
-7. Add comments explaining each transformation step.
-8. Handle nulls, type casting, and edge cases defensively.
-9. If the task is NOT an ETL/report build (e.g., ML model, data quality, migration),
+7. Add display(result_df.limit(20)) at the end for validation.
+8. Add comments explaining each transformation step.
+9. Handle nulls, type casting, and edge cases defensively.
+10. If the task is NOT an ETL/report build (e.g., ML model, data quality, migration),
    adapt your code accordingly — you are a general-purpose coding agent.
-10. NEVER use dbutils.widgets — the notebook will be run programmatically.
+11. NEVER use dbutils.widgets — the notebook will be run programmatically.
+12. NEVER use spark.read.format("delta").load("table.name") — use spark.table("catalog.schema.table").
 """
+
+# Sample actual raw_json from each bronze source so the LLM knows real field paths
+bronze_json_samples = {}
+for src in yaml_spec.get("bronze_sources", []):
+    try:
+        row = spark.table(src).select("raw_json").limit(1).collect()
+        if row:
+            import json as _json
+            parsed = _json.loads(row[0]["raw_json"])
+            bronze_json_samples[src] = _json.dumps(parsed, indent=2)[:1200]
+    except Exception:
+        pass
+
+json_samples_text = "\n".join(f"--- {tbl} sample raw_json ---\n{sample}" for tbl, sample in bronze_json_samples.items())
 
 coding_prompt = f"""
 == TASK ==
@@ -157,6 +177,15 @@ Implement the following requirement. Recommendation: {recommendation}
 
 == TARGET TABLE ==
 {target_table}
+
+== ACTUAL BRONZE TABLE raw_json SAMPLES (use these exact JSON paths!) ==
+{json_samples_text}
+
+IMPORTANT: Use the EXACT JSON field paths shown above. For example:
+- Encounter period: F.get_json_object(F.col("raw_json"), "$.period.start")
+- Encounter class: F.get_json_object(F.col("raw_json"), "$.class.code")
+- Claim amounts: F.get_json_object(F.col("raw_json"), "$.total.value")
+- Organization name: F.get_json_object(F.col("raw_json"), "$.name")
 
 Generate the complete PySpark implementation code.
 """
@@ -350,14 +379,15 @@ def add_test(name: str, passed: bool, detail: str):
 
 # ---- Test 1: Table exists ----
 table_exists = False
-parts = target_table.split(".")
 try:
-    if len(parts) == 3:
-        table_exists = spark.catalog.tableExists(parts[2], f"{parts[0]}.{parts[1]}")
-    else:
-        table_exists = spark.catalog.tableExists(target_table)
+    table_exists = spark.catalog.tableExists(target_table)
 except Exception:
-    table_exists = False
+    try:
+        # Fallback: try SQL check
+        spark.sql(f"DESCRIBE TABLE {target_table}")
+        table_exists = True
+    except Exception:
+        table_exists = False
 
 if table_exists:
     result_df = spark.table(target_table)
@@ -416,6 +446,198 @@ passed = sum(1 for t in test_results["tests"] if t["passed"])
 total = len(test_results["tests"])
 test_results["pass_rate"] = f"{passed}/{total}"
 print(f"\nValidation: {passed}/{total} tests passed")
+
+# COMMAND ----------
+
+# DBTITLE 1,Retry Loop — Auto-Fix on Failure (up to 3 retries)
+# ---------------------------------------------------------------------------
+# RETRY LOOP: If sandbox or validation failed, feed the error back to
+# Agent 03A and regenerate code. Up to MAX_RETRIES attempts.
+# ---------------------------------------------------------------------------
+MAX_RETRIES = 3
+
+def _all_tests_pass() -> bool:
+    """Check if sandbox succeeded AND all validation tests passed."""
+    if sandbox_status != "SUCCESS":
+        return False
+    return all(t["passed"] for t in test_results.get("tests", []))
+
+def _build_fix_prompt(attempt: int, prev_code: str, error: str, tests: dict) -> str:
+    """Build an LLM prompt that includes the previous code + error feedback."""
+    failed_tests = [t for t in tests.get("tests", []) if not t["passed"]]
+    test_summary = "\n".join(f"  - {t['name']}: {t['detail']}" for t in failed_tests)
+    return f"""
+== RETRY ATTEMPT {attempt}/{MAX_RETRIES} ==
+
+Your previous code FAILED. Fix the issues below and regenerate COMPLETE code.
+
+== PREVIOUS CODE ==
+{prev_code}
+
+== EXECUTION ERROR ==
+{error or 'No runtime error (but validation tests failed)'}
+
+== FAILED TESTS ==
+{test_summary or 'All validation tests passed but sandbox execution failed'}
+
+== COMMON FIXES ==
+- Use spark.table("catalog.schema.table") NOT spark.read.format("delta").load("table.name")
+- Bronze tables have columns: raw_json (STRING), resource_id, resource_type, _source_file, _ingested_at
+- Parse raw_json with: F.get_json_object(F.col("raw_json"), "$.fieldName") for each field
+- Create schema first: spark.sql("CREATE SCHEMA IF NOT EXISTS ...")
+- Write with: df.write.format("delta").mode("overwrite").option("overwriteSchema","true").saveAsTable("...")
+- NEVER use spark.read.format("delta").load() with a table name — use spark.table()
+- NEVER use dbutils.widgets
+- AMBIGUOUS_REFERENCE fix: after joins, ALWAYS use table aliases. Example:
+    enc = spark.table("agentops.bronze.encounter").alias("enc")
+    claim = spark.table("agentops.bronze.claim").alias("claim")
+    joined = enc.join(claim, F.col("enc.resource_id") == F.col("claim.resource_id"))
+    joined.select(F.col("enc.resource_id").alias("encounter_id"), ...)
+- After parsing raw_json, rename common columns BEFORE joining to avoid ambiguity
+- For FHIR resources: resource_id in encounter is a UUID, use get_json_object to extract nested fields
+
+== ORIGINAL REQUIREMENT SPEC ==
+{yaml.dump(yaml_spec, default_flow_style=False)}
+
+== TARGET TABLE ==
+{target_table}
+
+== CATALOG ==
+{CATALOG}
+
+Generate the COMPLETE fixed PySpark code. Output ONLY executable code, no markdown.
+"""
+
+def _run_sandbox(code: str) -> tuple[str, str]:
+    """Execute code directly and return (status, error)."""
+    try:
+        exec(code)
+        return "SUCCESS", None
+    except Exception as e:
+        return "FAILED", str(e)[:500]
+
+def _run_validation() -> dict:
+    """Run the same validation tests as Agent 03B."""
+    results = {
+        "target_table": target_table,
+        "sandbox_status": sandbox_status,
+        "sandbox_error": sandbox_error,
+        "tests": [],
+    }
+    def _add(name, passed, detail):
+        results["tests"].append({"name": name, "passed": passed, "detail": detail})
+        s = "\u2713 PASS" if passed else "\u2717 FAIL"
+        print(f"    {s} | {name}: {detail}")
+
+    tbl_exists = False
+    parts = target_table.split(".")
+    try:
+        tbl_exists = spark.catalog.tableExists(f"{parts[0]}.{parts[1]}.{parts[2]}")
+    except Exception:
+        try:
+            tbl_exists = spark.catalog.tableExists(parts[2], f"{parts[0]}.{parts[1]}")
+        except Exception:
+            tbl_exists = False
+
+    if tbl_exists:
+        df = spark.table(target_table)
+        _add("table_exists", True, f"{target_table} exists")
+
+        rc = df.count()
+        _add("row_count", rc > 0, f"{rc:,} rows")
+
+        actual_cols = {c.name.lower() for c in df.schema.fields}
+        expected_metrics = [m["name"].lower().replace(" ", "_") for m in yaml_spec.get("metrics", [])]
+        matches = sum(1 for m in expected_metrics if any(m.replace(" ", "_") in c or c in m for c in actual_cols))
+        _add("metric_columns", matches / max(len(expected_metrics), 1) >= 0.5,
+             f"{matches}/{len(expected_metrics)} metrics found")
+
+        from pyspark.sql.functions import col as _col
+        nulls = [c for c in df.columns if df.where(_col(c).isNull()).count() == rc and rc > 0]
+        _add("no_all_null_columns", len(nulls) == 0, f"{len(nulls)} all-null cols")
+
+        results["row_count"] = rc
+        results["schema"] = [(f.name, str(f.dataType)) for f in df.schema.fields]
+        results["sample_rows"] = df.limit(5).toPandas().to_dict(orient="records")
+    else:
+        _add("table_exists", False, f"{target_table} not found")
+
+    passed = sum(1 for t in results["tests"] if t["passed"])
+    results["pass_rate"] = f"{passed}/{len(results['tests'])}"
+    return results
+
+# ---- Run retry loop ----
+retry_history = []
+if not _all_tests_pass():
+    print("=" * 60)
+    print("RETRY LOOP: Feeding errors back to Agent 03A")
+    print("=" * 60)
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        print(f"\n{'- ' * 30}")
+        print(f"RETRY {attempt}/{MAX_RETRIES}")
+        print(f"{'- ' * 30}")
+
+        # 1. Ask LLM to fix the code
+        fix_system = coding_system + "\n\nIMPORTANT: Your previous code failed. Fix the specific errors shown. Output ONLY executable Python code."
+        fix_prompt = _build_fix_prompt(attempt, generated_code, sandbox_error, test_results)
+        new_code = llm_call(fix_system, fix_prompt, temperature=0.0, max_tokens=4096)
+        new_code = re.sub(r'^```(?:python)?\s*', '', new_code)
+        new_code = re.sub(r'\s*```$', '', new_code)
+        print(f"  Regenerated code: {len(new_code)} chars")
+
+        # 2. Write updated notebook
+        full_code_updated = f"""# Auto-generated by Agent 03A (Coding Agent) — RETRY {attempt}
+# Request: {REQUEST_ID}
+# Target: {target_table}
+# Generated: {datetime.now(timezone.utc).isoformat()}
+# ---------------------------------------------------------------\n\n{new_code}\n"""
+        content_b64 = base64.b64encode(full_code_updated.encode("utf-8")).decode("utf-8")
+        requests.post(
+            f"https://{workspace_url}/api/2.0/workspace/import",
+            headers=headers,
+            json={"path": notebook_path, "format": "SOURCE", "language": "PYTHON",
+                  "content": content_b64, "overwrite": True},
+        )
+
+        # 3. Execute in sandbox
+        print(f"  Executing sandbox...")
+        sandbox_status, sandbox_error = _run_sandbox(new_code)
+        print(f"  Sandbox: {sandbox_status}" + (f" | Error: {sandbox_error[:150]}" if sandbox_error else ""))
+
+        # 4. Validate
+        print(f"  Validating...")
+        test_results = _run_validation()
+        print(f"  Validation: {test_results['pass_rate']}")
+
+        # 5. Update variables for downstream cells
+        generated_code = new_code
+        retry_history.append({
+            "attempt": attempt,
+            "sandbox_status": sandbox_status,
+            "sandbox_error": sandbox_error,
+            "pass_rate": test_results["pass_rate"],
+        })
+
+        if _all_tests_pass():
+            print(f"\n\u2713 RETRY {attempt} SUCCEEDED — all tests pass!")
+            break
+        else:
+            print(f"  \u2717 Still failing — {'retrying...' if attempt < MAX_RETRIES else 'max retries reached'}")
+    else:
+        print(f"\n\u2717 All {MAX_RETRIES} retries exhausted. Proceeding with best attempt.")
+
+    # Summary
+    print(f"\n{'=' * 60}")
+    print("RETRY SUMMARY")
+    print(f"{'=' * 60}")
+    for rh in retry_history:
+        status = "\u2713" if rh["sandbox_status"] == "SUCCESS" and "/" in rh["pass_rate"] and rh["pass_rate"].split("/")[0] == rh["pass_rate"].split("/")[1] else "\u2717"
+        print(f"  {status} Attempt {rh['attempt']}: sandbox={rh['sandbox_status']}  tests={rh['pass_rate']}")
+else:
+    print("\u2713 First attempt passed all tests — no retries needed.")
+
+print(f"\nFinal status: sandbox={sandbox_status}  tests={test_results.get('pass_rate', '?')}")
 
 # COMMAND ----------
 
