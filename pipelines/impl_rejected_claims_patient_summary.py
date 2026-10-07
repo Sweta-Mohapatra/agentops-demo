@@ -148,7 +148,7 @@ def load_sources(spark) -> dict:
         "patient": spark.table("agentops.silver.patient"),
     }
 
-# COMMAND ----------
+# COMMAND --------
 if RUN_MODE == "run" and not globals().get("AGENTOPS_LIBRARY_MODE", False):
     outputs = build(spark, load_sources(spark))
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS {TARGET_CATALOG}.{TARGET_SCHEMA}")
